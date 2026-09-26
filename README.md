@@ -184,6 +184,14 @@ You can config the yaml-file in `/configs`. For example, `/configs/AB_MIL.yaml`,
 #### **NN_MIL (nnMIL)**
 `configs/NN_MIL.yaml` adds the classification workflow from [nnMIL](https://github.com/Luoxd1996/nnMIL): fixed-length patch sub-bags for batched training, class-balanced mini-batches, random feature-subspace attention, and deterministic overlapping-subspace ensemble inference. Set `Model.fixed_bag_size: auto` to use half the median training patch count, or provide an explicit positive integer. During evaluation, `test_mil.py` writes `NN_MIL_predictions.csv` alongside standard metrics; it includes per-class probabilities, entropy, mutual information, probability variance and the number of subspaces. Padding is masked before attention softmax and therefore never contributes to slide aggregation.
 #### **Train & Test**
+The four existing multiscale research implementations can be launched through
+`train_mil.py` with `configs/{CS,DAS,H2,HAG}_MIL_COMMON.yaml`. These configs
+delegate to the audited research runner and retain its shared splits, training
+protocol, versioned artifacts, and checkpoint selection. The default `T` arm
+fits on train/validation data only; test evaluation is a separate research stage.
+Set `Model.research_runner`, `Model.research_python`, and `Logs.output_root` to
+the corresponding local paths before use.
+
 Then, `/train_mil.py` will help you like this:
 ``` shell
 python train_mil.py --yaml_path /configs/AB_MIL.yaml 

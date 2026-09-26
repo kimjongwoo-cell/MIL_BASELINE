@@ -1,14 +1,68 @@
 import argparse
-from utils.yaml_utils import read_yaml,update_config_from_options
-from process.process_all import process
 import warnings
 import os
-from utils.general_utils import get_time,merge_k_fold_logs
+import subprocess
+from pathlib import Path
 warnings.filterwarnings('ignore')
+
+OFFICIAL_MULTISCALE = {
+    'CS_MIL': 'csmil',
+    'DAS_MIL': 'dasmil',
+    'H2_MIL': 'h2_mil',
+    'HAG_MIL': 'hag_mil',
+}
+
+
+def run_official_multiscale(config, options):
+    """Use the existing audited research runner for the four scale-fusion methods."""
+    import yaml
+
+    for option in options or []:
+        key, separator, value = option.partition('=')
+        if not separator or key not in {
+            'General.seed', 'General.device', 'Dataset.cohorts',
+            'Dataset.folds', 'Model.arms',
+        }:
+            raise ValueError(f'unsupported multiscale option: {option}')
+        section, name = key.split('.')
+        config[section][name] = yaml.safe_load(value)
+
+    method = OFFICIAL_MULTISCALE[config['General']['MODEL_NAME']]
+    runner = Path(config['Model']['research_runner']).resolve()
+    interpreter = Path(config['Model']['research_python']).resolve()
+    if not runner.is_file():
+        raise FileNotFoundError(f'research runner not found: {runner}')
+    if not interpreter.is_file():
+        raise FileNotFoundError(f'research Python not found: {interpreter}')
+    cohorts = config['Dataset']['cohorts']
+    folds = config['Dataset']['folds']
+    arms = config['Model']['arms']
+    if (not isinstance(cohorts, list) or not isinstance(folds, list)
+            or not isinstance(arms, list) or not cohorts or not folds or not arms):
+        raise ValueError('cohorts, folds, and arms must be non-empty lists')
+    command = [
+        str(interpreter), str(runner), '--stage', 'unified-fits', '--methods', method,
+        '--cohorts', *cohorts, '--folds', *map(str, folds),
+        '--seeds', str(config['General']['seed']), '--arms', *arms,
+        '--output-root', str(Path(config['Logs']['output_root']).resolve()),
+        '--device', f"cuda:{config['General']['device']}",
+    ]
+    subprocess.run(command, check=True, cwd=runner.parents[1])
+
 
 def main(arg):
     yaml_path = arg.yaml_path
     print(f"MIL-yaml path: {yaml_path}")
+    import yaml
+    with open(yaml_path, encoding='utf-8') as handle:
+        raw_config = yaml.safe_load(handle)
+    if raw_config['General']['MODEL_NAME'] in OFFICIAL_MULTISCALE:
+        run_official_multiscale(raw_config, arg.options)
+        return
+
+    from utils.yaml_utils import read_yaml,update_config_from_options
+    from process.process_all import process
+    from utils.general_utils import get_time,merge_k_fold_logs
     args = read_yaml(yaml_path)
     # dinamically update the config file with the options
     if arg.options:

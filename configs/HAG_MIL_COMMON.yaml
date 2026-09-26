@@ -1,0 +1,13 @@
+General:
+  MODEL_NAME: HAG_MIL
+  seed: 1
+  device: 0
+Dataset:
+  cohorts: [BRCA, RCC, UCEC]
+  folds: [0, 1, 2, 3, 4]
+Logs:
+  output_root: /home/super/Jong/research/results
+Model:
+  arms: [T]
+  research_runner: /home/super/Jong/research-h2-v11/implementations/common_parent_feature_audit.py
+  research_python: /home/super/miniforge3/envs/btl/bin/python
