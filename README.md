@@ -191,6 +191,9 @@ protocol, versioned artifacts, and checkpoint selection. The default `T` arm
 fits on train/validation data only; test evaluation is a separate research stage.
 Set `Model.research_runner`, `Model.research_python`, and `Logs.output_root` to
 the corresponding local paths before use.
+After the default `T` arm, run the paired-shuffle `S` arm for any of the four
+configs with `--options 'Model.arms=[S]'`. Completed cells are reused only when
+their saved protocol identity matches.
 
 Then, `/train_mil.py` will help you like this:
 ``` shell
