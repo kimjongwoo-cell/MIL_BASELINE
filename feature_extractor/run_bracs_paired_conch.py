@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import hashlib
 import json
@@ -11,6 +12,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -249,6 +251,47 @@ def image_and_tensor(slide: openslide.OpenSlide, xy: tuple[int, int], wh: tuple[
     return image, preprocess(image)
 
 
+def prepare_parent(
+    slide: openslide.OpenSlide,
+    wsi: WholeSlideImage,
+    parent_index: int,
+    coords: np.ndarray,
+    parent_wh: list[int],
+    child_wh: list[int],
+    preprocess,
+) -> tuple[torch.Tensor, list[torch.Tensor], list[tuple[int, int]]]:
+    """Prepare one parent and its valid, row-major children without encoding."""
+    x, y = map(int, coords[parent_index])
+    _, parent_tensor = image_and_tensor(slide, (x, y), tuple(parent_wh), preprocess)
+    child_tensors: list[torch.Tensor] = []
+    child_slots: list[tuple[int, int]] = []
+    for gy in range(4):
+        for gx in range(4):
+            child_index = gy * 4 + gx
+            cx, cy = x + gx * child_wh[0], y + gy * child_wh[1]
+            if not child_tissue_valid(wsi, cx, cy, child_wh):
+                continue
+            child_image, child_tensor = image_and_tensor(slide, (cx, cy), tuple(child_wh), preprocess)
+            rgb = np.asarray(child_image)
+            if isBlackPatch(rgb, rgbThresh=50) or isWhitePatch(rgb, satThresh=15):
+                continue
+            child_slots.append((parent_index, child_index))
+            child_tensors.append(child_tensor)
+    return parent_tensor, child_tensors, child_slots
+
+
+def prepare_batch(prepared_parents) -> tuple[list[torch.Tensor], list[torch.Tensor], list[tuple[int, int]]]:
+    """Flatten parent results in their supplied order, preserving child slots."""
+    parent_tensors: list[torch.Tensor] = []
+    child_tensors: list[torch.Tensor] = []
+    child_slots: list[tuple[int, int]] = []
+    for parent_tensor, children, slots in prepared_parents:
+        parent_tensors.append(parent_tensor)
+        child_tensors.extend(children)
+        child_slots.extend(slots)
+    return parent_tensors, child_tensors, child_slots
+
+
 def encode(model, tensors: list[torch.Tensor], device: torch.device) -> np.ndarray:
     outputs = []
     for start in range(0, len(tensors), ENCODE_BATCH_SIZE):
@@ -280,13 +323,21 @@ def extract_one(
     identity: str,
     provenance: dict,
     progress: Callable[[str, int, int], None],
+    patch_workers: int = 4,
 ) -> dict:
+    if patch_workers < 0:
+        raise ValueError("patch_workers must be zero or greater")
+    extraction_started = time.perf_counter()
     source_before = path.stat()
     actual_bytes = source_before.st_size
     if actual_bytes != expected_bytes:
         raise ValueError(f"source is not complete: got {actual_bytes} bytes, expected {expected_bytes}")
     slide = openslide.OpenSlide(str(path))
     wsi = None
+    executor = None
+    worker_slides: list[openslide.OpenSlide] = []
+    worker_slides_lock = threading.Lock()
+    worker_local = threading.local()
     try:
         geometry = slide_geometry(slide)
         parent_wh = geometry["parent_level0_wh"]
@@ -315,36 +366,64 @@ def extract_one(
             ):
                 raise RuntimeError("source slide changed during feature extraction")
             return {"state": "no_tissue", "reason": "CLAM tissue segmentation selected zero complete-origin parent tiles", "geometry": geometry}
+        segmentation_seconds = time.perf_counter() - extraction_started
+        patch_wait_seconds = 0.0
+        encode_seconds = 0.0
         x5 = np.zeros((p, FEATURE_DIM), dtype=np.float16)
         x20 = np.zeros((p, 16, FEATURE_DIM), dtype=np.float16)
         valid = np.zeros((p, 16), dtype=np.bool_)
         progress("encoding", 0, p)
+        if patch_workers:
+            executor = ThreadPoolExecutor(max_workers=patch_workers)
+
+            def prepare_in_worker(parent_index: int):
+                worker_slide = getattr(worker_local, "slide", None)
+                if worker_slide is None:
+                    worker_slide = openslide.OpenSlide(str(path))
+                    worker_local.slide = worker_slide
+                    with worker_slides_lock:
+                        worker_slides.append(worker_slide)
+                return prepare_parent(worker_slide, wsi, parent_index, coords, parent_wh, child_wh, preprocess)
+
+        else:
+            def prepare_in_worker(parent_index: int):
+                return prepare_parent(slide, wsi, parent_index, coords, parent_wh, child_wh, preprocess)
+
+        next_start = 0
+        next_end = min(ENCODE_BATCH_SIZE, p)
+        pending = (
+            [executor.submit(prepare_in_worker, i) for i in range(next_start, next_end)]
+            if executor is not None
+            else None
+        )
         for start in range(0, p, ENCODE_BATCH_SIZE):
             end = min(start + ENCODE_BATCH_SIZE, p)
-            parent_tensors: list[torch.Tensor] = []
-            child_tensors: list[torch.Tensor] = []
-            child_slots: list[tuple[int, int]] = []
-            for i in range(start, end):
-                x, y = map(int, coords[i])
-                _, parent_tensor = image_and_tensor(slide, (x, y), tuple(parent_wh), preprocess)
-                parent_tensors.append(parent_tensor)
-                for gy in range(4):
-                    for gx in range(4):
-                        index = gy * 4 + gx
-                        cx, cy = x + gx * child_wh[0], y + gy * child_wh[1]
-                        if child_tissue_valid(wsi, cx, cy, child_wh):
-                            child_image, child_tensor = image_and_tensor(slide, (cx, cy), tuple(child_wh), preprocess)
-                            rgb = np.asarray(child_image)
-                            if isBlackPatch(rgb, rgbThresh=50) or isWhitePatch(rgb, satThresh=15):
-                                continue
-                            child_slots.append((i, index))
-                            child_tensors.append(child_tensor)
+            progress("patch_prepare", start, p)
+            preparation_started = time.perf_counter()
+            if pending is None:
+                prepared = [prepare_in_worker(i) for i in range(start, end)]
+            else:
+                prepared = [future.result() for future in pending]
+            # Keep at most one following parent chunk in flight while this
+            # chunk is encoded; retrieving futures in submission order keeps
+            # the original parent and row-major child order.
+            next_start, next_end = end, min(end + ENCODE_BATCH_SIZE, p)
+            pending = (
+                [executor.submit(prepare_in_worker, i) for i in range(next_start, next_end)]
+                if executor is not None and next_start < p
+                else None
+            )
+            parent_tensors, child_tensors, child_slots = prepare_batch(prepared)
+            patch_wait_seconds += time.perf_counter() - preparation_started
+            progress("encoding", start, p)
+            encoding_started = time.perf_counter()
             x5[start:end] = encode(model, parent_tensors, device)
             if child_tensors:
                 child_features = encode(model, child_tensors, device)
                 for (parent_index, child_index), features in zip(child_slots, child_features):
                     x20[parent_index, child_index] = features
                     valid[parent_index, child_index] = True
+            encode_seconds += time.perf_counter() - encoding_started
             progress("encoding", end, p)
 
         source_after = path.stat()
@@ -355,6 +434,10 @@ def extract_one(
         ):
             raise RuntimeError("source slide changed during feature extraction")
     finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        for worker_slide in worker_slides:
+            worker_slide.close()
         slide.close()
         if wsi is not None:
             wsi.wsi.close()
@@ -402,7 +485,37 @@ def extract_one(
         "geometry": geometry,
         "dataset_provenance": provenance,
         "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "timing_seconds": {
+            "total": time.perf_counter() - extraction_started,
+            "segmentation": segmentation_seconds,
+            "patch_wait": patch_wait_seconds,
+            "encoding": encode_seconds,
+        },
     }
+
+
+def validated_resume_identity(audit_path: Path | None, config: dict) -> str | None:
+    if audit_path is None:
+        return None
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    baseline = audit["baseline_config"]
+    baseline_identity = hashlib.sha256(json.dumps(baseline, sort_keys=True).encode()).hexdigest()
+    if audit.get("compatible_identity") != baseline_identity:
+        raise ValueError("resume audit baseline identity does not match its config")
+    if audit.get("optimized_source_sha256") != config["implementation_sha256"]:
+        raise ValueError("resume audit does not cover the current implementation")
+    snapshot = Path(audit["baseline_source"])
+    if sha256_file(snapshot) != baseline.get("implementation_sha256"):
+        raise ValueError("resume audit baseline source hash mismatch")
+    performance_keys = {"implementation_sha256", "patch_workers", "prefetch_batches"}
+    scientific_config = lambda value: {k: v for k, v in value.items() if k not in performance_keys}
+    if scientific_config(baseline) != scientific_config(config):
+        raise ValueError("resume audit cannot authorize a changed feature protocol")
+    checks = audit.get("checks", {})
+    required = {"preprocessed_tensors_exact", "child_slots_exact", "features_exact", "coordinates_exact", "masks_exact"}
+    if audit.get("state") != "passed" or not all(checks.get(key) is True for key in required):
+        raise ValueError("resume requires a passed patch and feature equivalence audit")
+    return baseline_identity
 
 
 def main() -> None:
@@ -418,6 +531,8 @@ def main() -> None:
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--max-slides", type=int, default=0, help="stop after this many new completed slides; 0 means unlimited")
     parser.add_argument("--batch-size", type=int, default=ENCODE_BATCH_SIZE)
+    parser.add_argument("--patch-workers", type=int, default=4, help="ordered CPU patch preparation workers; 0 keeps serial preparation")
+    parser.add_argument("--resume-audit", type=Path, help="passed equivalence receipt permitting reuse of the original implementation's outputs")
     args = parser.parse_args()
     args.status.parent.mkdir(parents=True, exist_ok=True)
     lock_file = args.status.with_suffix(args.status.suffix + ".lock")
@@ -428,6 +543,8 @@ def main() -> None:
         raise RuntimeError(f"another BRACS extraction process holds {lock_file}") from exc
     if args.batch_size < 1 or args.batch_size > 64:
         parser.error("--batch-size must be between 1 and 64")
+    if not 0 <= args.patch_workers <= 16:
+        parser.error("--patch-workers must be between 0 and 16")
     ENCODE_BATCH_SIZE = args.batch_size
 
     if not args.weights.is_file() or not args.inventory.is_file() or not args.workbook.is_file():
@@ -440,6 +557,8 @@ def main() -> None:
     config = {
         "protocol": PROTOCOL,
         "implementation_sha256": sha256_file(Path(__file__)),
+        "patch_workers": args.patch_workers,
+        "prefetch_batches": 1 if args.patch_workers else 0,
         "encoder_sha256": weights_sha,
         "model": MODEL_NAME,
         "preprocess": "official create_model_from_pretrained transform",
@@ -458,6 +577,10 @@ def main() -> None:
         "workbook_sha256": workbook_summary["workbook_sha256"],
     }
     identity = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+    compatible_identity = validated_resume_identity(args.resume_audit, config)
+    accepted_identities = {identity}
+    if compatible_identity is not None:
+        accepted_identities.add(compatible_identity)
     status = {"schema_version": 1, "config": config, "identity": identity, "slides": {}}
     if args.status.exists():
         prior = json.loads(args.status.read_text(encoding="utf-8"))
@@ -465,12 +588,15 @@ def main() -> None:
             status = prior
             status.setdefault("slides", {})
         else:
+            if prior.get("identity") in accepted_identities:
+                status["slides"] = json.loads(json.dumps(prior.get("slides", {})))
             status["history"] = prior.get("history", []) + [{
                 "identity": prior.get("identity"),
                 "config": prior.get("config"),
                 "slides": prior.get("slides", {}),
             }]
     status["dataset_provenance"] = workbook_summary
+    status["execution"] = {"patch_workers": args.patch_workers, "prefetch_batches": config["prefetch_batches"], "resume_audit": str(args.resume_audit) if args.resume_audit else None}
     args.output.mkdir(parents=True, exist_ok=True)
 
     if not torch.cuda.is_available():
@@ -479,7 +605,7 @@ def main() -> None:
         raise RuntimeError("the visible CUDA device does not support required BF16 inference")
     torch.cuda.set_device(0)
     device = torch.device("cuda:0")
-    print(f"CONCH device={device}; CUDA BF16=True; batch={ENCODE_BATCH_SIZE}", flush=True)
+    print(f"CONCH device={device}; CUDA BF16=True; batch={ENCODE_BATCH_SIZE}; patch_workers={args.patch_workers}", flush=True)
     model, preprocess = create_model_from_pretrained(MODEL_NAME, checkpoint_path=str(args.weights))
     model = model.to(device).eval()
     done_this_run = 0
@@ -491,14 +617,21 @@ def main() -> None:
             output_path = args.output / path.relative_to(args.source).with_suffix(".h5")
             entry = status["slides"].get(str(path), {})
             if output_path.is_file():
-                if entry.get("state") == "complete" and entry.get("identity") == identity:
+                source_stat = path.stat()
+                if (entry.get("state") == "complete" and entry.get("identity") in accepted_identities
+                        and entry.get("output") == str(output_path)
+                        and entry.get("source_bytes") == source_stat.st_size
+                        and entry.get("source_mtime_ns_after") == source_stat.st_mtime_ns
+                        and entry.get("source_inode") == source_stat.st_ino):
                     continue
                 try:
                     with h5py.File(output_path, "r") as f:
                         identity_ok = (
-                            f.attrs.get("identity", "") == identity
+                            f.attrs.get("identity", "") in accepted_identities
                             and f.attrs.get("source_path", "") == str(path)
                             and int(f.attrs.get("source_expected_bytes", -1)) == expected
+                            and int(f.attrs.get("source_mtime_ns_after", -1)) == source_stat.st_mtime_ns
+                            and int(f.attrs.get("source_inode", -1)) == source_stat.st_ino
                         )
                         n = f["x5_conch"].shape[0]
                         valid_output = identity_ok and (
@@ -517,14 +650,18 @@ def main() -> None:
                             valid_output &= bool(np.isfinite(f["x5_conch"][:]).all())
                             valid_output &= bool(np.isfinite(f["x20_conch"][:]).all())
                         parents = n
+                        output_identity = f.attrs.get("identity", "")
                 except Exception:
                     valid_output = False
                 if valid_output:
                     status["slides"][str(path)] = {
                         "state": "complete",
-                        "identity": identity,
+                        "identity": output_identity,
                         "output": str(output_path),
                         "parents": parents,
+                        "source_bytes": source_stat.st_size,
+                        "source_mtime_ns_after": source_stat.st_mtime_ns,
+                        "source_inode": source_stat.st_ino,
                         "recovered_from_output": True,
                     }
                 else:
@@ -535,9 +672,9 @@ def main() -> None:
                         "error": "existing output failed source/identity/schema validation; refusing overwrite",
                     }
                 continue
-            if entry.get("state") in {"complete", "no_tissue"} and entry.get("identity") == identity:
+            if entry.get("state") == "complete" and entry.get("identity") in accepted_identities:
                 status["slides"].pop(str(path), None)
-            if entry.get("state") in {"error", "no_tissue", "identity_conflict"} and entry.get("identity") == identity:
+            if entry.get("state") in {"error", "no_tissue", "identity_conflict"} and entry.get("identity") in accepted_identities:
                 continue
             pending.append((path, expected, output_path))
         if not pending:
@@ -545,7 +682,8 @@ def main() -> None:
                 break
             all_downloaded = all(path.is_file() and path.stat().st_size == size for path, size in inventory.items())
             terminal = {"complete", "no_tissue", "error", "identity_conflict"}
-            all_settled = all(status["slides"].get(str(path), {}).get("state") in terminal for path in inventory)
+            all_settled = all(status["slides"].get(str(path), {}).get("state") in terminal
+                              and status["slides"].get(str(path), {}).get("identity") in accepted_identities for path in inventory)
             if all_downloaded and all_settled:
                 failures = sum(status["slides"].get(str(path), {}).get("state") != "complete" for path in inventory)
                 print(f"All BRACS inventory slides settled; {failures} did not produce features.", flush=True)
@@ -587,7 +725,8 @@ def main() -> None:
                     "workbook_sha256": workbook_summary["workbook_sha256"],
                     "raw_partition": path.relative_to(args.source).parts[0],
                 })
-                result = extract_one(path, expected, output_path, model, preprocess, device, identity, provenance, update_progress)
+                result = extract_one(path, expected, output_path, model, preprocess, device, identity, provenance, update_progress,
+                                     patch_workers=args.patch_workers)
                 result["identity"] = identity
                 status["slides"][key] = result
                 if result["state"] == "complete":
